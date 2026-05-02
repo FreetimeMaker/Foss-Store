@@ -1,15 +1,45 @@
-name: Build, Sign and Conditional Release
+name: Build, Sign and Release Android App
 
 on:
   push:
     branches:
-      - '**'
+      - master
+  workflow_dispatch:
 
 permissions:
   contents: write
+  id-token: write
 
 jobs:
-  build:
+  prepare_android_app:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.versioncheck.outputs.version }}
+      create_tag: ${{ steps.versioncheck.outputs.create_tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Detect version & create tag
+        id: versioncheck
+        run: |
+          VERSION=$(grep 'versionName' app/build.gradle.kts | sed -E 's/.*versionName[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+          git fetch --tags
+
+          if git rev-parse "v$VERSION" >/dev/null 2>&1; then
+            echo "create_tag=false" >> "$GITHUB_OUTPUT"
+          else
+            git tag "v$VERSION"
+            git push origin "v$VERSION"
+            echo "create_tag=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build_sign_and_release_android_app:
+    needs: prepare_android_app
     runs-on: ubuntu-latest
 
     steps:
@@ -18,91 +48,103 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Detect version & create tag if missing
-        id: versioncheck
-        run: |
-          set -e
-
-          # Detect gradle file
-          if [ -f "app/build.gradle.kts" ]; then
-            FILE="app/build.gradle.kts"
-          elif [ -f "app/build.gradle" ]; then
-            FILE="app/build.gradle"
-          else
-            echo "No build.gradle(.kts) found in app/"
-            exit 1
-          fi
-
-          echo "Using file: $FILE"
-
-          # Extract versionName (supports all formats)
-          LINE=$(grep 'versionName' "$FILE" | head -n1 || true)
-          echo "Matched line: $LINE"
-
-          VERSION=$(printf '%s\n' "$LINE" | sed -E 's/.*versionName[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/')
-
-          if [ -z "$VERSION" ]; then
-            echo "Could not extract versionName from $FILE"
-            exit 1
-          fi
-
-          echo "Detected version: $VERSION"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-
-          # Ensure tags are available
-          git fetch --tags
-
-          # Check if tag exists
-          if git rev-parse "v$VERSION" >/dev/null 2>&1; then
-            echo "Tag v$VERSION already exists. Skipping tag creation."
-            echo "create_tag=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "Tag v$VERSION does not exist. Creating it."
-            git tag "v$VERSION"
-            git push origin "v$VERSION"
-            echo "create_tag=true" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Stop workflow if tag already existed
-        if: steps.versioncheck.outputs.create_tag == 'false'
-        run: |
-          echo "Tag already existed — stopping workflow."
-          exit 0
-
       - name: Install Java
         uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: 17
+          cache: 'gradle'
 
-      - name: Make script executable
-        run: chmod +x ./build_and_sign_workflow.sh
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
 
-      - name: Build & Sign APK
-        run: ./build_and_sign_workflow.sh
+      - name: Build Android App
+        run: ./gradlew :app:assembleRelease
 
-      - name: Upload APK as workflow artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: GeoWeather-${{ steps.versioncheck.outputs.version }}.apk
-          path: GeoWeather-*.apk
-
-      - name: Check if actor is repo owner
-        id: ownercheck
+      # ---------------------------------------
+      # 🔥 VIRUSTOTAL SCAN BEFORE SIGNING
+      # ---------------------------------------
+      - name: VirusTotal Scan
+        id: vt_scan
         run: |
-          if [ "${{ github.actor }}" = "${{ github.repository_owner }}" ]; then
-            echo "is_owner=true" >> $GITHUB_OUTPUT
-          else
-            echo "is_owner=false" >> $GITHUB_OUTPUT
+          APK="app/build/outputs/apk/release/app-release-unsigned.apk"
+
+          echo "==> Uploading APK to VirusTotal..."
+          RESPONSE=$(curl -s -X POST "https://www.virustotal.com/api/v3/files" \
+            -H "x-apikey: $VT_API_KEY" \
+            -F "file=@${APK}")
+
+          ANALYSIS_ID=$(echo "$RESPONSE" | jq -r '.data.id')
+
+          echo "Analysis ID: $ANALYSIS_ID"
+
+          echo "==> Waiting for VirusTotal analysis..."
+          STATUS="queued"
+
+          while [ "$STATUS" != "completed" ]; do
+            sleep 10
+            RESULT=$(curl -s "https://www.virustotal.com/api/v3/analyses/$ANALYSIS_ID" \
+              -H "x-apikey: $VT_API_KEY")
+            STATUS=$(echo "$RESULT" | jq -r '.data.attributes.status')
+            echo "Status: $STATUS"
+          done
+
+          MALICIOUS=$(echo "$RESULT" | jq -r '.data.attributes.stats.malicious')
+
+          echo "Malicious count: $MALICIOUS"
+
+          if [ "$MALICIOUS" != "0" ]; then
+            echo "❌ VirusTotal detected malware!"
+            exit 1
           fi
 
-      - name: Create GitHub Release (only if owner)
-        if: steps.ownercheck.outputs.is_owner == 'true'
+          echo "✅ VirusTotal reports: CLEAN"
+        env:
+          VT_API_KEY: ${{ secrets.VT_API_KEY }}
+
+      - name: Find APKSIGNER
+        id: find_apksigner
+        run: |
+          APKSIGNER=$(find /usr/local/lib/android/sdk/build-tools -name apksigner | head -n 1)
+          echo "apksigner=$APKSIGNER" >> $GITHUB_OUTPUT
+
+      - name: Sign Android
+        id: sign_apk
+        run: |
+          UNSIGNED_APK="app/build/outputs/apk/release/app-release-unsigned.apk"
+          SIGNED_APK="Foss-Store-v${{ needs.prepare_android_app.outputs.version }}.apk"
+
+          echo "==> Signiere APK: $SIGNED_APK"
+          "${{ steps.find_apksigner.outputs.apksigner }}" sign \
+            --ks ./Foss-Store-KeyStore.jks \
+            --ks-key-alias alle \
+            --ks-pass pass:KKKKKK \
+            --key-pass pass:KKKKKK \
+            --out "$SIGNED_APK" \
+            "$UNSIGNED_APK"
+
+          echo "signed_apk=$SIGNED_APK" >> $GITHUB_OUTPUT
+
+      - name: Verify APK Signature
+        run: |
+          echo "==> Überprüfe Signatur"
+          "${{ steps.find_apksigner.outputs.apksigner }}" verify --verbose \
+            "${{ steps.sign_apk.outputs.signed_apk }}"
+
+      - name: Upload APK as build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: Foss-Store-v${{ needs.prepare_android_app.outputs.version }}.apk
+          path: Foss-Store-v${{ needs.prepare_android_app.outputs.version }}.apk
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Upload APK to Release
+        if: needs.prepare_android_app.outputs.create_tag == 'true'
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: v${{ steps.versioncheck.outputs.version }}
-          name: "GeoWeather ${{ steps.versioncheck.outputs.version }}"
-          body: "Automatisch gebaut und signiert."
+          tag_name: v${{ needs.prepare_android_app.outputs.version }}
+          files: |
+            Foss-Store-v${{ needs.prepare_android_app.outputs.version }}.apk
           draft: true
-          prerelease: false
-          files: "GeoWeather-*.apk"
+          generate_release_notes: true
